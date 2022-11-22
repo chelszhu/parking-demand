@@ -1,0 +1,14 @@
+---
+title: "Forecasting parking demand"
+author: "Yanbing Zhao, Chenxi Zhu"
+date: "December 16, 2022"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+editor_options: 
+  chunk_output_type: inline
+  markdown: 
+    wrap: sentence
+---
