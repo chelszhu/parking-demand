@@ -12,3 +12,315 @@ editor_options:
   markdown: 
     wrap: sentence
 ---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+```
+
+```{r load_packages, warning = FALSE}
+options(scipen=10000000)
+
+library(tidyverse)
+library(kableExtra)
+library(caret)
+library(knitr) 
+library(pscl)
+library(plotROC)
+library(pROC)
+library(lubridate)
+library(tidycensus)
+library(broom)
+library(RSocrata)
+library(sf)
+library(riem)
+library(gridExtra)
+library(viridis)
+library(spatstat)
+library(raster)
+library(spdep)
+library(FNN)
+library(grid)
+library(classInt)
+
+# data directory
+source("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/functions.r")
+
+# root.dir = "https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/DATA/"
+# subsidy <- read.csv(file.path(root.dir,"/Chapter6/housingSubsidy.csv"))
+
+palette5 <- c("#981FAC","#CB0F8B","#FF006A","#FE4C35","#FE9900")
+palette4 <- c("#981FAC","#FF006A","#FE4C35","#FE9900")
+palette2 <- c("#981FAC","#FF006A")
+```
+
+Read meter and transaction data.
+```{r read_data, warning=FALSE, message=FALSE}
+epsg <- 'EPSG:6419'
+district <- st_read("data/Planning Districts.geojson") %>% filter(district == "Downtown") %>%
+  st_transform(epsg)
+
+# collect downtown meters and transactions only
+meter <- read.csv("data/Parking_Meters.csv") %>%
+  st_as_sf(coords = c("LONGITUDE", "LATITUDE"), crs = 4326, agr = "constant") %>%
+  st_transform(epsg)# %>%
+  # st_join(., district) %>%
+  # filter(!is.na(district))
+
+street <- st_read("data/Speed Limits per Street Segment.geojson") %>%
+  st_transform(epsg) %>%
+  st_join(., district) %>%
+  filter(!is.na(district))
+
+# time_frame <- 
+transaction <- read.socrata("https://data.sfgov.org/resource/imvp-dq3v.json?$where=session_start_dt between '2022-01-10T12:00:00' and '2022-01-15T12:00:00'")
+transaction <- transaction[transaction$post_id %in% meter$POST_ID, ]
+
+# index table to connect block - street id - post id
+idx <- read.csv("data/index_table.csv")
+```
+
+Visualize spatial distribution of meters in downtown.
+```{r visualize_downtown_meters, warning=FALSE, message=FALSE}
+ggplot() + 
+  geom_sf(data = district) +
+  # geom_sf(data = street) +
+  geom_sf(data = meter%>%st_join(., district) %>% filter(!is.na(district)), colour="blue", size = 0.1, show.legend = "point") +
+  labs(title= "Parking Meters in Downtown") +
+  mapTheme(title_size = 14)
+```
+
+```{r for_complete_panel_creation, warning=FALSE, message=FALSE, include=FLASE}
+weather.panel <- 
+  riem_measures(station = "SFO", date_start = "2022-01-10", date_end = "2022-01-15") %>%
+  dplyr::select(valid, tmpf, p01i, sknt)%>%
+  replace(is.na(.), 0) %>%
+    mutate(interval60 = ymd_h(substr(valid,1,13))) %>%
+    mutate(week = week(interval60),
+           dotw = wday(interval60, label=TRUE)) %>%
+    group_by(interval60) %>%
+    summarize(Temperature = max(tmpf),
+              Precipitation = sum(p01i),
+              Wind_Speed = max(sknt)) %>%
+    mutate(Temperature = ifelse(Temperature == 0, 42, Temperature))
+```
+
+
+```{r panel_setup, warning=FALSE, message=FALSE}
+occ.panel =
+  expand.grid(interval60 = unique(weather.panel$interval60), 
+              POST_ID = unique(transaction$post_id))%>%
+  mutate(parking_time_in_60m = 0,
+         index = row_number())
+```
+
+```{r calculate_occupancy, warning=FALSE, message=FALSE}
+dat2 <- transaction %>%
+  # filter(post_id == "923-00001") %>%
+  mutate(end_interval = floor_date(ymd_hms(session_end_dt), unit = "1 hour"),
+         start_interval = floor_date(ymd_hms(session_start_dt), unit = "1 hour"),
+         length = end_interval - start_interval,
+         tokens = as.numeric(length )/ 900*4,
+         tokens_00 = ifelse(tokens >= 1, 1, 0),
+         tokens_01 = ifelse(tokens >= 2, 1, 0),
+         tokens_02 = ifelse(tokens >=   3, 1, 0),
+         # tokens_03 = ifelse(tokens >= 4, 1, 0),
+         # tokens_04 = ifelse(tokens >= 5, 1, 0),
+         # tokens_05 = ifelse(tokens >= 6, 1, 0),
+         # tokens_06 = ifelse(tokens >= 7, 1, 0),
+         # tokens_07 = ifelse(tokens >= 8, 1, 0),
+         # tokens_08 = ifelse(tokens >= 9, 1, 0),
+         # tokens_09 = ifelse(tokens >= 10, 1, 0),
+         # tokens_10 = ifelse(tokens >= 11, 1, 0),
+         # tokens_11 = ifelse(tokens >= 12, 1, 0)
+         )
+
+dat3 <- dat2 %>%
+  group_by(start_interval, post_id) %>%
+  summarize(tokens_00 = sum(tokens_00),
+            tokens_01 = sum(tokens_01),
+            tokens_02 = sum(tokens_02),
+            # tokens_03 = sum(tokens_03),
+            # tokens_04 = sum(tokens_04),
+            # tokens_05 = sum(tokens_05),
+            # tokens_06 = sum(tokens_06),
+            # tokens_07 = sum(tokens_07),
+            # tokens_08 = sum(tokens_08),
+            # tokens_09 = sum(tokens_09),
+            # tokens_10 = sum(tokens_10),
+            # tokens_11 = sum(tokens_11)
+            )
+
+# Create a panel consisting of all the time/meter observations in the set
+# Add a day of the year to each observation, join it to the transaction data
+# This might need to be tinkered with to make sure every time period for every meter is included
+# There are some weird one-off transactions off hours that might need to be cleaned out
+
+study.panel <- 
+  expand.grid(start_interval=unique(dat3$start_interval), 
+              post_id = unique(dat3$post_id)) %>%
+  mutate(doty = yday(start_interval)) %>%
+  left_join(., dat3)
+
+# Estimate occupancy but compiling the current tokens and the previous tokens
+# that carry forward - i think (i think) the observations at 15:00 hours are the people who start
+# the day parking - not every place has the same metered hours
+
+transaction_panel <- study.panel %>%
+  replace(is.na(.), 0) %>%
+  arrange(start_interval) %>%
+  group_by(post_id, doty) %>%
+  mutate(lag01 = ifelse(is.na(lag(tokens_01)) == FALSE, lag(tokens_01), 0),
+         lag02 = ifelse(is.na(lag(tokens_02)) == FALSE, lag(tokens_02), 0),
+         # lag03 = ifelse(is.na(lag(tokens_03)) == FALSE, lag(tokens_03), 0),
+         # lag04 = ifelse(is.na(lag(tokens_04)) == FALSE, lag(tokens_04), 0),
+         # lag05 = ifelse(is.na(lag(tokens_05)) == FALSE, lag(tokens_05), 0),
+         # lag06 = ifelse(is.na(lag(tokens_06)) == FALSE, lag(tokens_06), 0),
+         # lag07 = ifelse(is.na(lag(tokens_07)) == FALSE, lag(tokens_07), 0),
+         # lag08 = ifelse(is.na(lag(tokens_08)) == FALSE, lag(tokens_08), 0),
+         # lag09 = ifelse(is.na(lag(tokens_08)) == FALSE, lag(tokens_09), 0),
+         # lag10 = ifelse(is.na(lag(tokens_10)) == FALSE, lag(tokens_10), 0),
+         # lag11 = ifelse(is.na(lag(tokens_11)) == FALSE, lag(tokens_11), 0)
+         ) %>%
+  mutate(occupancy = tokens_00 + lag01 + lag02) %>%
+  filter(is.na(occupancy) == FALSE) %>%
+  dplyr::select(start_interval, post_id, occupancy)
+
+```
+
+Percipitation would not be a helpful independent variable since San Francisco is quite dry in the autumn.
+```{r weather_panel, fig.width=6, fig.height=6, warning=FALSE, message=FALSE}
+weather.panel <- 
+  riem_measures(station = "SFO", date_start = "2022-01-10", date_end = "2022-01-15") %>%
+  dplyr::select(valid, tmpf, p01i, sknt)%>%
+  replace(is.na(.), 0) %>%
+    mutate(interval60 = ymd_h(substr(valid,1,13))) %>%
+    mutate(week = week(interval60),
+           dotw = wday(interval60, label=TRUE)) %>%
+    group_by(interval60) %>%
+    summarize(Temperature = max(tmpf),
+              Precipitation = sum(p01i),
+              Wind_Speed = max(sknt)) %>%
+    mutate(Temperature = ifelse(Temperature == 0, 42, Temperature))
+
+grid.arrange(top = "Weather Data - San Francisco SFO - April, 2022",
+  ggplot(weather.panel, aes(interval60, Precipitation)) + geom_line() + 
+    labs(title="Percipitation", x="Hour", y="Precipitation") + plotTheme(),
+  ggplot(weather.panel, aes(interval60, Wind_Speed)) + geom_line() + 
+    labs(title="Wind Speed", x="Hour", y="Wind Speed") + plotTheme(),
+  ggplot(weather.panel, aes(interval60, Temperature)) + geom_line() + 
+    labs(title="Temperature", x="Hour", y="Temperature") + plotTheme())
+```
+
+```{r spatial_features, warning=FALSE, message=FALSE}
+# time sensitive
+## sidewalk cleaning -- join to street segment
+cleaning <- read.csv("data/Street_and_Sidewalk_Cleaning Count updated.csv")
+
+# time insensitive
+## pedestrian safety zone -- join to street segment, keep units
+ped.safety.zone <- st_read("data/Painted Safety Zones updated.geojson") %>%
+  st_transform(epsg) %>%
+  st_join(., district) %>%
+  filter(!is.na(district))
+
+## park -- nn_function
+park <-st_read("data/Park Lands - Recreation and Parks Department updated.geojson") %>%
+  st_transform(epsg)
+
+## on street carshare parking -- nn_function
+carshare.parking <- st_read("data/On-street_Carshare_Parking updated.geojson") %>%
+  st_transform(epsg)
+
+## poi -- nn_function
+poi <- st_read("data/Registered Business Locations - San Francisco updated.geojson") %>%
+  st_transform(epsg)
+
+## sidewalk width -- join to street segment, keep sidewalk_f
+sidewalk.width <- read.csv("data/MTA.sidewalk_widths updated.csv")
+
+street$park.nn <- nn_function(st_coordinates(st_centroid(street)), st_coordinates(st_centroid(park)), k = 3)
+street$carshare.parking.nn <- nn_function(st_coordinates(st_centroid(street)), st_coordinates(carshare.parking), k = 3)
+street$poi.nn <- nn_function(st_coordinates(st_centroid(street)), st_coordinates(poi), k = 3)
+
+spatial_features <- street %>%
+  st_drop_geometry() %>%
+  dplyr::select(ST_ID, st_type, speedlimit, park.nn, carshare.parking.nn, poi.nn) %>% 
+  left_join(ped.safety.zone %>% st_drop_geometry() %>% dplyr::select(ST_ID, units), by="ST_ID") %>%
+  left_join(sidewalk.width, by="ST_ID")
+
+spatial_features$units <- as.numeric(spatial_features$units)
+spatial_features$speedlimit <- as.numeric(spatial_features$speedlimit)
+
+spatial_features[is.na(spatial_features)]$st_type <- "Unknown"
+spatial_features[is.na(spatial_features)]$units <- 0
+```
+
+```{r visualize_nn_features, warning=FALSE, message=FALSE}
+spatial_features %>%
+  pivot_longer(cols=ends_with(".nn"), names_to="name1", values_to="value_raw")%>%
+  mutate(value_logged = log(value_raw))%>%
+  pivot_longer(cols=starts_with("value"), names_to="if_log", values_to="name_log")%>%
+  mutate(across(if_log, factor, levels=c("value_raw","value_logged"))) %>%
+  ggplot() +
+    geom_histogram(aes(name_log,fill=name1), bins=50)+
+    scale_fill_manual(values=inferno(18)[5:11], guide=F)+
+    facet_wrap(if_log~name1,scales = "free", nrow=2)+
+    plotTheme()+
+    labs(title='Distribution of Nearest Neighbor Variables',
+         subtitle = 'San Francisco, 2021.9', x="")
+```
+
+```{r visualize_sidewalk_width, warning=FALSE, message=FALSE}
+spatial_features.sf <- merge(street %>% dplyr::select(ST_ID), spatial_features, by="ST_ID")
+
+ggplot(spatial_features.sf) + 
+  geom_sf(aes(fill = speedlimit)) +
+  # scale_fill_viridis() +
+  # geom_sf(data = street) +
+  # geom_sf(data = meter%>%st_join(., district) %>% filter(!is.na(district)), colour="blue", size = 0.1, show.legend = "point") +
+  labs(title= "Sidewalk Widths") +
+  mapTheme(title_size = 14)
+```
+
+```{r construct_complete_panel, warning=FALSE, message=FALSE}
+# join everything
+transaction_panel <- left_join(transaction_panel, transaction %>% dplyr::select(post_id, street_block) %>% unique()) %>%
+  mutate(POST_ID = post_id) %>% 
+  dplyr::select(-post_id) %>%
+  merge(idx, by="POST_ID")
+
+# 
+# transaction_panel <- transaction_panel %>%
+#   group_by(ST_ID", "doty", "start_interval15") %>%
+#   summarize(total_occupancy = sum(occupancy))
+# 
+#   # merge(transaction_panel %>% mutate(POST_ID = post_id) %>% dplyr::select(-post_id), by="POST_ID")
+
+panel <- spatial_features %>%
+  merge(transaction_panel %>%
+          group_by(ST_ID, doty, start_interval) %>%
+          summarize(total_occupancy = sum(occupancy)), by="ST_ID")
+
+panel <- panel %>%
+  arrange(ST_ID, start_interval) %>% 
+  mutate(lagHour = dplyr::lag(total_occupancy, 1),
+         lag2Hours = dplyr::lag(total_occupancy, 2),
+         lag3Hours = dplyr::lag(total_occupancy, 3),
+         lag12Hours = dplyr::lag(total_occupancy, 12),
+         lag1day = dplyr::lag(total_occupancy, 24)) %>%
+  ungroup()
+```
+
+```{r}
+ggplot(panel) +
+  geom_histogram(aes(x = total_occupancy), color="white", fill = "light blue") +
+  labs(title = "Occupancy Distribution", x = "Occupancy Count", y = "Count", subtitle = "San Francisco Downtown") +
+  plotTheme()
+```
+
+```{r model, warning=FALSE, message=FALSE}
+reg <- glm(total_occupancy ~  st_type + hour(start_interval) + speedlimit + park.nn + carshare.parking.nn + poi.nn + units + sidewalk_f +lagHour,  data=panel, family = poisson)
+
+summary(reg)
+```
+
