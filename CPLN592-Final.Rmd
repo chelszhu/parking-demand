@@ -41,6 +41,12 @@ library(spdep)
 library(FNN)
 library(grid)
 library(classInt)
+# library(patchwork)
+library(ggplot2)
+library(gganimate)
+library(hms)
+library(gifski)
+library(stargazer)
 
 # data directory
 source("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/functions.r")
@@ -54,6 +60,7 @@ palette2 <- c("#981FAC","#FF006A")
 ```
 
 Read meter and transaction data.
+
 ```{r read_data, warning=FALSE, message=FALSE}
 epsg <- 'EPSG:6419'
 district <- st_read("data/Planning Districts.geojson") %>% filter(district == "Downtown") %>%
@@ -72,7 +79,7 @@ street <- st_read("data/Speed Limits per Street Segment.geojson") %>%
   filter(!is.na(district))
 
 # time_frame <- 
-transaction <- read.socrata("https://data.sfgov.org/resource/imvp-dq3v.json?$where=session_start_dt between '2022-01-10T12:00:00' and '2022-01-15T12:00:00'")
+transaction <- read.socrata("https://data.sfgov.org/resource/imvp-dq3v.json?$where=session_start_dt between '2022-01-03T12:00:00' and '2022-01-23T12:00:00'")
 transaction <- transaction[transaction$post_id %in% meter$POST_ID, ]
 
 # index table to connect block - street id - post id
@@ -80,6 +87,7 @@ idx <- read.csv("data/index_table.csv")
 ```
 
 Visualize spatial distribution of meters in downtown.
+
 ```{r visualize_downtown_meters, warning=FALSE, message=FALSE}
 ggplot() + 
   geom_sf(data = district) +
@@ -89,9 +97,11 @@ ggplot() +
   mapTheme(title_size = 14)
 ```
 
+### Dependent Variable
+
 ```{r for_complete_panel_creation, warning=FALSE, message=FALSE, include=FLASE}
 weather.panel <- 
-  riem_measures(station = "SFO", date_start = "2022-01-10", date_end = "2022-01-15") %>%
+  riem_measures(station = "SFO", date_start = "2022-01-03", date_end = "2022-01-23") %>%
   dplyr::select(valid, tmpf, p01i, sknt)%>%
   replace(is.na(.), 0) %>%
     mutate(interval60 = ymd_h(substr(valid,1,13))) %>%
@@ -104,6 +114,7 @@ weather.panel <-
     mutate(Temperature = ifelse(Temperature == 0, 42, Temperature))
 ```
 
+average occupancy rate by street segment aggregated by meter
 
 ```{r panel_setup, warning=FALSE, message=FALSE}
 occ.panel =
@@ -187,29 +198,36 @@ transaction_panel <- study.panel %>%
 
 ```
 
-Percipitation would not be a helpful independent variable since San Francisco is quite dry in the autumn.
+### Independent Variables
+
+#### Weather Panel
+
+Percipitation would not be a helpful independent variable since San Francisco is quite dry during the investigated period.
+
 ```{r weather_panel, fig.width=6, fig.height=6, warning=FALSE, message=FALSE}
 weather.panel <- 
-  riem_measures(station = "SFO", date_start = "2022-01-10", date_end = "2022-01-15") %>%
+  riem_measures(station = "SFO", date_start = "2022-01-03", date_end = "2022-01-23") %>%
   dplyr::select(valid, tmpf, p01i, sknt)%>%
   replace(is.na(.), 0) %>%
-    mutate(interval60 = ymd_h(substr(valid,1,13))) %>%
-    mutate(week = week(interval60),
-           dotw = wday(interval60, label=TRUE)) %>%
-    group_by(interval60) %>%
+    mutate(start_interval = ymd_h(substr(valid,1,13))) %>%
+    mutate(week = week(start_interval),
+           dotw = wday(start_interval, label=TRUE)) %>%
+    group_by(start_interval) %>%
     summarize(Temperature = max(tmpf),
               Precipitation = sum(p01i),
               Wind_Speed = max(sknt)) %>%
     mutate(Temperature = ifelse(Temperature == 0, 42, Temperature))
 
 grid.arrange(top = "Weather Data - San Francisco SFO - April, 2022",
-  ggplot(weather.panel, aes(interval60, Precipitation)) + geom_line() + 
+  ggplot(weather.panel, aes(start_interval, Precipitation)) + geom_line(color=plasma(8)[2]) + 
     labs(title="Percipitation", x="Hour", y="Precipitation") + plotTheme(),
-  ggplot(weather.panel, aes(interval60, Wind_Speed)) + geom_line() + 
+  ggplot(weather.panel, aes(start_interval, Wind_Speed)) + geom_line(color=plasma(8)[2]) + 
     labs(title="Wind Speed", x="Hour", y="Wind Speed") + plotTheme(),
-  ggplot(weather.panel, aes(interval60, Temperature)) + geom_line() + 
+  ggplot(weather.panel, aes(start_interval, Temperature)) + geom_line(color=plasma(8)[2]) + 
     labs(title="Temperature", x="Hour", y="Temperature") + plotTheme())
 ```
+
+#### Amenities and Spatial Features
 
 ```{r spatial_features, warning=FALSE, message=FALSE}
 # time sensitive
@@ -251,8 +269,8 @@ spatial_features <- street %>%
 spatial_features$units <- as.numeric(spatial_features$units)
 spatial_features$speedlimit <- as.numeric(spatial_features$speedlimit)
 
-spatial_features[is.na(spatial_features)]$st_type <- "Unknown"
-spatial_features[is.na(spatial_features)]$units <- 0
+spatial_features$st_type <- spatial_features$st_type %>% replace_na("unknown")
+spatial_features$units <- spatial_features$units %>% replace_na(0)
 ```
 
 ```{r visualize_nn_features, warning=FALSE, message=FALSE}
@@ -270,7 +288,7 @@ spatial_features %>%
          subtitle = 'San Francisco, 2021.9', x="")
 ```
 
-```{r visualize_sidewalk_width, warning=FALSE, message=FALSE}
+```{r visualize_sidewalk_width, warning=FALSE, message=FALSE, include=FALSE}
 spatial_features.sf <- merge(street %>% dplyr::select(ST_ID), spatial_features, by="ST_ID")
 
 ggplot(spatial_features.sf) + 
@@ -307,20 +325,204 @@ panel <- panel %>%
          lag2Hours = dplyr::lag(total_occupancy, 2),
          lag3Hours = dplyr::lag(total_occupancy, 3),
          lag12Hours = dplyr::lag(total_occupancy, 12),
-         lag1day = dplyr::lag(total_occupancy, 24)) %>%
-  ungroup()
+         lag1day = dplyr::lag(total_occupancy, 24),
+         week = week(start_interval),
+         wday = wday(start_interval, label=TRUE)) %>%
+  ungroup() %>%
+  merge(weather.panel, by="start_interval")
+
+```
+
+```{r plot_lag_correlation, warning=FALSE, message=FALSE}
+plotData.lag <-
+  as.data.frame(panel)%>%
+  dplyr::select(starts_with("lag"), total_occupancy) %>%
+  gather(Variable, Value, -total_occupancy) %>%
+  mutate(Variable = fct_relevel(Variable, "lagHour","lag2Hours","lag3Hours",
+                                "lag4Hours","lag12Hours","lag1day"))
+correlation.lag <-
+  group_by(plotData.lag, Variable) %>%
+  summarize(correlation = round(cor(Value, total_occupancy, use = "complete.obs"), 2))
+
+plotData.lag %>% sample_n(100000)%>%
+ggplot(aes(Value, total_occupancy)) +
+  geom_point(size = 0.1) +
+  geom_text(data = correlation.lag, 
+            aes(label = paste("r =", round(correlation, 2))),
+            x=-Inf, y=Inf, vjust = 1.5, hjust = -.1,size=5) +
+  geom_smooth(method = "lm", se = FALSE, color = plasma(8)[2]) +
+  facet_wrap(~Variable, nrow = 2, scales = "free") +
+  labs(title = "") +
+  plotTheme()
 ```
 
 ```{r}
 ggplot(panel) +
-  geom_histogram(aes(x = total_occupancy), color="white", fill = "light blue") +
+  geom_histogram(aes(x = total_occupancy), color="white", fill = plasma(8)[1]) +
   labs(title = "Occupancy Distribution", x = "Occupancy Count", y = "Count", subtitle = "San Francisco Downtown") +
   plotTheme()
 ```
+```{r temporal_pattern}
+# transaction_panel %>%
+#   filter(interval60>= "2021-09-01 00:00:00" & interval60 <= "2021-09-30 23:59:59")%>%
+#   group_by(interval60, status)%>%
+#   summarise(parking_time_in_60m = sum(parking_time_in_60m))%>%
+#   ggplot(aes(ymd_hms(interval60),parking_time_in_60m, colour = status))+
+#     geom_line()+
+#   geom_vline(data = sundays, aes(xintercept = sunday))+
+#   scale_colour_manual(values = p2)+
+#   labs(title="Total Parking Time by week in SF: September 2021",
+#        x="Day", y="Total Parking Time (Second)") +
+#   plotTheme() + theme(panel.grid.major = element_blank())
+
+int.ampeak <- interval(as_hms("07:00:00"),as_hms("10:00:00"))
+int.pmpeak <- interval(as_hms("15:00:00"),as_hms("18:00:00"))
+int.midday <- interval(as_hms("10:00:00"),as_hms("15:00:00"))
+int.night <- interval(as_hms("18:00:00"),as_hms("23:00:00"))
+int.overnight <- interval(as_hms("00:00:00"),as_hms("07:00:00"))
+
+panel.temporal <- panel %>%
+  mutate(period = case_when(ymd_hms(paste0('1970-01-01',str_sub(start_interval, 12)))%within% int.ampeak ~ "AM",
+                            ymd_hms(paste0('1970-01-01',str_sub(start_interval, 12)))%within% int.pmpeak ~ "PM",
+                            ymd_hms(paste0('1970-01-01',str_sub(start_interval, 12)))%within% int.midday ~ "Mid_Day",
+                            ymd_hms(paste0('1970-01-01',str_sub(start_interval, 12)))%within% int.night ~ "Night",
+                            ymd_hms(paste0('1970-01-01',str_sub(start_interval, 12)))%within% int.overnight ~ "Overnight"))
+
+
+panel.temporal %>%
+  mutate(across(period, factor, levels=c("Overnight","AM","Mid_Day","PM","Night"))) %>%
+  group_by(start_interval, ST_ID, period) %>%
+  summarize(mean_occupancy = mean(total_occupancy))%>%
+  ggplot()+
+  geom_histogram(aes(mean_occupancy), color="white", fill=plasma(8)[5])+
+  labs(title="Mean Occupancy Per Street Segment",
+       subtitle="San Francisco, 2022.1",
+       x="Mean Occupancy", 
+       y="Frequency")+
+  facet_wrap(~period)+
+  plotTheme()
+```
+```{r animation}
+panel.sf <- merge(street%>%dplyr::select(ST_ID), panel, by="ST_ID") %>%
+  filter(doty == 3) %>% 
+  mutate(hour = hour(start_interval)) %>%
+  dplyr::select(ST_ID, hour, total_occupancy) %>%
+  st_sf() %>%
+  rename(time_hour = hour)
+
+map.lables <- qBr(panel.sf, "total_occupancy")
+
+animation =
+  ggplot()+
+    #geom_sf(data = sf_neighborhood, fill="#cccccc", color="#999999")+
+    geom_sf(data= panel.sf, 
+            aes(color=total_occupancy, size=total_occupancy, alpha=total_occupancy),
+            stroke = .5, shape = 16)+
+    viridis::scale_color_viridis(option = "C")+
+    scale_size_continuous(range = c(0.5,4))+
+    scale_alpha_continuous(range = c(0.5,1))+
+    transition_manual(time_hour) +
+    labs(title="Occupancy per Street Segments by Hour",
+         subtitle = "Time: {current_frame}:00, San Francisco, 2022.1")+
+    mapTheme()
+
+# animate(animation, duration=20, renderer = gifski_renderer())
+anim_save("ani.gif", height = 800, width =800, animation, duration=4, renderer = gifski_renderer())
+
+animate(animation, duration=10, renderer = gifski_renderer())
+```
+
 
 ```{r model, warning=FALSE, message=FALSE}
-reg <- glm(total_occupancy ~  st_type + hour(start_interval) + speedlimit + park.nn + carshare.parking.nn + poi.nn + units + sidewalk_f +lagHour,  data=panel, family = poisson)
+panel.train <- panel %>% filter(week < 4)
+panel.test <- panel %>% filter(week == 4)
 
-summary(reg)
+# reg <- glm(total_occupancy ~  st_type + hour(start_interval) + speedlimit + park.nn + carshare.parking.nn + poi.nn + units + sidewalk_f +lagHour,  data=panel, family = poisson())
+
+reg1 <- lm(total_occupancy ~  Temperature + Precipitation + Wind_Speed,  data=panel.train)
+
+reg2 <- lm(total_occupancy ~  st_type + speedlimit + park.nn + carshare.parking.nn + poi.nn + units + sidewalk_f + Temperature + Precipitation + Wind_Speed,  data=panel.train)
+
+reg3 <- lm(total_occupancy ~  st_type + hour(start_interval) + speedlimit + park.nn + carshare.parking.nn + poi.nn + units + sidewalk_f + Temperature + Precipitation + Wind_Speed + wday,  data=panel.train)
+
+reg4 <- lm(total_occupancy ~  st_type + hour(start_interval) + speedlimit + park.nn + carshare.parking.nn + poi.nn + units + sidewalk_f +lagHour + lag2Hours + lag3Hours + lag12Hours + lag1day + wday + Temperature + Precipitation + Wind_Speed,  data=panel.train)
+```
+
+
+```{r model_comparison, warning=FALSE, message=FALSE}
+model_pred <- function(dat, fit){
+   pred <- predict(fit, newdata = dat)}
+
+panel.test.weekNest <- 
+  panel.test %>%
+  nest(-week) 
+
+week_predictions <- 
+  panel.test.weekNest %>% 
+    mutate(Weather_model = map(.x = data, fit = reg1, .f = model_pred),
+           Weather_Space_model = map(.x = data, fit = reg2, .f = model_pred),
+           Weather_Space_Time_model = map(.x = data, fit = reg3, .f = model_pred),
+           Weather_Space_Time_Lag_model = map(.x = data, fit = reg4, .f = model_pred))
+
+mean.na = function(x) {mean(x,na.rm=T)}
+sd.na = function(x) {sd(x,na.rm=T)}
+week_predictions
+
+week_predictions <- week_predictions %>%  
+    gather(Regression, Prediction, -data, -week) %>% 
+    mutate(Observed = map(data, pull, total_occupancy),
+           Absolute_Error = map2(Observed, Prediction,  ~ abs(.x - .y)),
+           MAE = map_dbl(Absolute_Error, mean.na),
+           sd_AE = map_dbl(Absolute_Error, sd.na))
+
+week_predictions %>%
+  dplyr::select(week, Regression, MAE) %>%
+  gather(Variable, MAE, -Regression, -week) %>%
+  mutate(
+    across(Regression,factor,levels=c("Weather_model","Weather_Space_model","Weather_Space_Time_model",
+                                    "Weather_Space_Time_Lag_model"))
+  )%>%
+  ggplot(aes(week%>%as.factor(), MAE)) + 
+    geom_bar(aes(fill = Regression), position = "dodge", stat="identity") +
+    scale_fill_manual(values = plasma(8)[2:6]) +
+    labs(title = "Mean Absolute Errors by model specification and week",x="week") +
+  plotTheme()
+
+```
+
+```{r, include=FALSE}
+# week_predictions %>% 
+#   mutate(start_interval = map(data, pull, start_interval)) %>%
+#   dplyr::select(start_interval, Observed, Prediction, Regression) %>%
+#   unnest() %>%
+#   gather(Variable, Value, -Regression, -start_interval) %>%
+#   group_by(Regression, Variable, start_interval) %>%
+#   summarize(Value = mean(Value,na.rm=T)) %>%
+#   ungroup%>%
+#   mutate(
+#     across(Regression,factor,levels=c("Weather_model","Weather_Space_model","Weather_Space_Time_model",
+#                                     "Weather_Space_Time_Lag_model"))
+#   )%>%
+#   filter(Regression!="Poisson_model") %>% 
+#   ggplot(aes(start_interval, Value, colour=Variable)) + 
+#   geom_line(size = .8) + 
+#   facet_wrap(~Regression, ncol=1) +
+#   labs(title = "Mean Predicted/Observed Parking Time by hourly interval", 
+#        x = "Date", y= "Parking Time") +
+#   plotTheme()
+```
+
+```{r cross_validation, warning=FALSE, message=FALSE}
+fitControl <- trainControl(method = "cv", number = 100)
+set.seed(26)
+reg.cv = train(total_occupancy ~  st_type + hour(start_interval) + speedlimit + park.nn + carshare.parking.nn + poi.nn + units + sidewalk_f +lagHour + lag2Hours + lag3Hours + lag12Hours + lag1day + wday + Temperature + Precipitation + Wind_Speed,  data=panel.train,
+     method = "lm", trControl = fitControl, na.action = na.pass)
+
+
+MAE4 <- reg.cv$resample
+ggplot(MAE4, aes(x=MAE)) + 
+  geom_histogram(color="white", fill = plasma(8)[6]) +
+  labs(title = "Histogram of MAE of Cross Validation", subtitle = "Model: Weather_Space_Time_Lag",  x = "MAE", y= "Count") +
+  plotTheme()
 ```
 
